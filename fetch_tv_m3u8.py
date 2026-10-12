@@ -13,18 +13,11 @@
                          同一频道多个地址=多行同名，播放器里按"确定"键换源）
 
 用法：
-  python fetch_tv_m3u8.py                  采集 + 深度检测（推荐，需几分钟）
+  python fetch_tv_m3u8.py                  采集 + 检测可用性（推荐，需几分钟）
   python fetch_tv_m3u8.py --no-check       只采集不检测，几秒完成
-  python fetch_tv_m3u8.py --no-deep        只做浅检测（不看分片，会漏掉占位流）
   python fetch_tv_m3u8.py --workers 128 --timeout 5
   python fetch_tv_m3u8.py --max-per-channel 12
   python fetch_tv_m3u8.py --keep-dead      检测后仍保留失效地址（标记保留）
-
-检测规则（默认深度检测）：
-  1. HTTP 状态码必须为 2xx，否则删除
-  2. 解析播放列表，取首个媒体分片；分片下载失败（连接错误/超时/非2xx）删除
-  3. 首个分片小于 --seg-min-kb（默认 20KB）判定为"无信号"占位流，删除
-     —— 这类流返回 200 和 HLS 头，但画面只是"信号中断"静态图循环
 """
 
 import argparse
@@ -40,7 +33,6 @@ import zlib
 from html import unescape
 from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import urljoin
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -448,75 +440,16 @@ def fetch_haoqu_source(timeout=15, max_pages=800):
     return "好趣网目录", HAOQU_ROOT, items
 
 
-SEG_MIN_BYTES = 20 * 1024  # 首个媒体分片小于此值 => "无信号"占位流
-
-
-def _first_segment(text, base):
-    """从播放列表取第一个媒体分片地址（自动跳过 master 的码率变体行）。"""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for i, l in enumerate(lines):
-        if l.startswith("#EXT-X-STREAM-INF"):
-            for j in range(i + 1, len(lines)):
-                if lines[j] and not lines[j].startswith("#"):
-                    return urljoin(base, lines[j])
-    for l in lines:
-        if not l.startswith("#"):
-            return urljoin(base, l)
-    return None
-
-
-def _segment_size(url, timeout):
-    """只取首个分片大小：优先 Content-Length，否则最多读 300KB 估算。"""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA, "Accept": "*/*", "Connection": "close"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
-            if not 200 <= resp.getcode() < 300:
-                return None
-            cl = resp.headers.get("Content-Length")
-            if cl is not None:
-                return int(cl)
-            return len(resp.read(300 * 1024))
-    except Exception:
-        return None
-
-
-def check_url(url, timeout, deep=True, retries=2):
-    """返回 ok / http / seg / ph：
-      ok   = 可用
-      http = 状态码或连接错误
-      seg  = 分片反复不可下载（死链）
-      ph   = 分片过小，判定为"无信号"占位流
-    除 ok 外都应在最终结果中删除。"""
-    code, data = http_get(url, timeout=timeout, max_bytes=65536)
+def check_url(url, timeout):
+    code, data = http_get(url, timeout=timeout, max_bytes=4096)
+    # 只有 2xx 成功响应才允许进入最终列表；3xx/4xx/5xx 或无状态码均删除。
     if code is None or not 200 <= code < 300 or data is None:
-        return "http"
-    text = data.decode("utf-8", "ignore")
-    up = text.upper()
-    if "#EXTM3U" not in up and "#EXT-X" not in up:
-        # 非 HLS 直链（flv/mp4/ts）：2xx 即视为可用；其余丢弃
-        low = url.lower().split("?")[0]
-        return "ok" if (".m3u8" in low or ".flv" in low or ".mp4" in low
-                        or ".ts" in low or "MPEGURL" in up) else "http"
-    if not deep:
-        return "ok"
-    seg = _first_segment(text, url)
-    depth = 0
-    while seg and seg.split("?")[0].lower().endswith(".m3u8") and depth < 2:
-        _, d2 = http_get(seg, timeout=timeout, max_bytes=65536)
-        if not d2:
-            break
-        seg = _first_segment(d2.decode("utf-8", "ignore"), seg)
-        depth += 1
-    if not seg:
-        return "ok"  # 解析不出分片，保守保留
-    for _ in range(retries + 1):
-        size = _segment_size(seg, timeout)
-        if size is None:
-            time.sleep(0.4)
-            continue
-        return "ok" if size >= SEG_MIN_BYTES else "ph"
-    return "seg"
+        return False
+    head = data[:4096].decode("utf-8", "ignore").upper()
+    if "#EXTM3U" in head or "#EXT-X" in head:
+        return True
+    # 有些源不返回标准 HLS 头，放宽判断，但仍必须先通过 2xx 状态码检查。
+    return ".M3U8" in url.upper() or "MPEGURL" in head
 
 
 def natural_key(name):
@@ -532,10 +465,6 @@ def main():
 
     ap = argparse.ArgumentParser(description="全国电视台直播源采集")
     ap.add_argument("--no-check", action="store_true", help="不检测可用性（速度快）")
-    ap.add_argument("--no-deep", action="store_true",
-                    help="只做浅检测（不检查分片，会漏掉'无信号'占位流）")
-    ap.add_argument("--seg-min-kb", type=int, default=20,
-                    help="首个分片小于该值视为无信号占位流（默认20KB）")
     ap.add_argument("--timeout", type=int, default=6, help="单地址检测超时秒数（默认6）")
     ap.add_argument("--workers", type=int, default=80, help="并发检测线程数（默认80）")
     ap.add_argument("--max-per-channel", type=int, default=8,
@@ -544,9 +473,6 @@ def main():
                     help="检测后仍保留失效地址")
     ap.add_argument("--out-prefix", default="tv_channels", help="输出文件名前缀")
     args = ap.parse_args()
-
-    global SEG_MIN_BYTES
-    SEG_MIN_BYTES = max(1, args.seg_min_kb) * 1024
 
     print("=" * 56)
     print(" 全国电视台直播源采集")
@@ -592,26 +518,20 @@ def main():
 
     keep = None  # None = 全部保留
     if not args.no_check:
-        mode = "浅检测" if args.no_deep else "深度检测(状态码+分片+占位流)"
-        print("\n[3/3] 检测可用性（%s，超时 %ds，并发 %d）..."
-              % (mode, args.timeout, args.workers))
+        print("\n[3/3] 检测可用性（超时 %ds，并发 %d）..." % (args.timeout, args.workers))
         alive = set()
-        stats = {"http": 0, "seg": 0, "ph": 0}
         done = 0
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(check_url, u, args.timeout, not args.no_deep): u
-                    for u in unique_urls}
+            futs = {ex.submit(check_url, u, args.timeout): u for u in unique_urls}
             for fut in concurrent.futures.as_completed(futs):
                 u = futs[fut]
                 try:
-                    st = fut.result()
+                    ok = fut.result()
                 except Exception:
-                    st = "http"
-                if st == "ok":
+                    ok = False
+                if ok:
                     alive.add(u)
-                else:
-                    stats[st] = stats.get(st, 0) + 1
                 done += 1
                 if done % 200 == 0 or done == len(unique_urls):
                     rate = done / max(time.time() - t0, 0.1)
@@ -620,8 +540,6 @@ def main():
         if not args.keep_dead:
             keep = alive
         print("  可用地址 %d / %d" % (len(alive), len(unique_urls)))
-        print("  已剔除：状态码/连接错误 %d，分片不可下载 %d，无信号占位流 %d"
-              % (stats.get("http", 0), stats.get("seg", 0), stats.get("ph", 0)))
     else:
         print("\n[3/3] 跳过检测（--no-check）")
 
