@@ -6,7 +6,10 @@
 功能：
   1. 从多个公开直播源聚合列表抓取全国电视台直播地址（m3u8 为主）
   2. 频道名自动归一化，同一频道的多个地址合并在一起
-  3. 默认逐条检测可用性并剔除死链（--no-check 可关闭）
+  3. 默认逐条检测并分三级（--no-check 可关闭）：
+       确认可播（列表正常且分片可取）> 降级备用（列表正常但当下未取到分片，
+       这类源的分片时有时无）> 直接删除（错误码 / 网页错误页 / 无信号占位流 /
+       空播放列表）。同一频道内按"确认可播优先、再按实测速度从高到低"排列
   4. 保存为电视软件通用解析格式：
        tv_channels.m3u   M3U 标准格式（VLC / PotPlayer / TVBox 直接导入）
        tv_channels.txt   DIYP / TVBox 通用格式（频道名,链接 + #genre# 分组，
@@ -23,6 +26,7 @@
 import argparse
 import concurrent.futures
 import gzip
+import json
 import re
 import ssl
 import sys
@@ -33,6 +37,7 @@ import zlib
 from html import unescape
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import quote, urljoin
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -76,6 +81,10 @@ SOURCES = [
         "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/ipv6.m3u",
         "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/tv.m3u",
         "https://cdn.jsdelivr.net/gh/fanmingming/live@main/tv/m3u/ipv6.m3u",
+    ]),
+    ("tvbox-autolive直播源", [
+        "https://raw.githubusercontent.com/jwqsir2-lang/tvbox-autolive/main/tvbox.json",
+        "https://cdn.jsdelivr.net/gh/jwqsir2-lang/tvbox-autolive@main/tvbox.json",
     ]),
 ]
 
@@ -342,6 +351,47 @@ def parse_txt(text):
     return items
 
 
+def parse_tvbox_json(text):
+    """解析 TVBox 配置里的 lives 直播列表。
+
+    返回 ([(频道名, url)], [待展开的列表地址])。
+    urls 字段的地址末尾常带 $线路N 后缀，去掉后才是真正的播放地址。
+    """
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return [], []
+    items, sub_lists = [], []
+    for live in obj.get("lives") or []:
+        if not isinstance(live, dict):
+            continue
+        for ch in live.get("channels") or []:
+            if not isinstance(ch, dict):
+                continue
+            name = str(ch.get("name") or "").strip()
+            for u in ch.get("urls") or []:
+                u = str(u).split("$")[0].strip()
+                if name and u.startswith(("http://", "https://")):
+                    items.append((name, u))
+        # 有些配置的 lives 项直接指向一个 m3u/txt 列表文件，展开一层
+        u = str(live.get("url") or "").strip()
+        if re.search(r"\.(?:m3u|txt|json)(?:$|\?)", u, re.I):
+            sub_lists.append(u)
+    return items, sub_lists
+
+
+def fetch_nested_lists(list_urls, timeout):
+    """展开 TVBox 配置里 lives 指向的 m3u/txt 列表文件（只展开一层）。"""
+    items = []
+    for u in list_urls:
+        _, data = http_get(u, timeout=timeout)
+        if not data:
+            continue
+        text = data.decode("utf-8", "ignore")
+        items.extend(parse_m3u(text) if "#EXTINF" in text else parse_txt(text))
+    return items
+
+
 def parse_haoqu_page(text, region):
     """从好趣网频道目录/详情页提取公开媒体地址。返回 [(频道名, url)]。"""
     text = unescape(text).replace("\\/", "/")
@@ -372,8 +422,21 @@ def extract_haoqu_channels(text, region_url):
     return list(OrderedDict(((n, u), True) for n, u in result).keys())
 
 
-def http_get(url, timeout=10, max_bytes=None):
-    req = urllib.request.Request(url, headers={
+def safe_url(url):
+    """转义 URL 里的非 ASCII 字符（中文路径等），避免 urllib 抛 UnicodeEncodeError。"""
+    try:
+        return quote(url, safe="%:/?#[]@!$&'()*+,;=~")
+    except Exception:
+        return url
+
+
+def http_get_final(url, timeout=10, max_bytes=None):
+    """请求 URL 并跟随重定向，返回 (状态码, 数据, 最终地址)。
+
+    最终地址很关键：不少 IPTV 源的 m3u8 会 302 跳到另一台服务器，
+    分片相对路径必须以跳转后的地址为基准解析，否则会全部取到 404。
+    """
+    req = urllib.request.Request(safe_url(url), headers={
         "User-Agent": UA,
         "Accept": "*/*",
         "Accept-Encoding": "gzip",
@@ -382,18 +445,24 @@ def http_get(url, timeout=10, max_bytes=None):
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
             code = resp.getcode()
+            final = resp.geturl() or url
             data = resp.read(max_bytes) if max_bytes else resp.read()
             if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
                 try:
                     data = gzip.decompress(data)
                 except (OSError, EOFError, zlib.error):
                     pass  # 截断的 gzip，保留原始字节做粗略判断
-            return code, data
+            return code, data, final
     except urllib.error.HTTPError as exc:
         # HTTPError 也可能携带响应体，但错误码必须视为不可用，交给调用方剔除。
-        return exc.code, None
+        return exc.code, None, getattr(exc, "url", None) or url
     except Exception:
-        return None, None
+        return None, None, url
+
+
+def http_get(url, timeout=10, max_bytes=None):
+    code, data, _ = http_get_final(url, timeout, max_bytes)
+    return code, data
 
 
 def fetch_source(label, urls, timeout=25):
@@ -408,7 +477,13 @@ def fetch_source(label, urls, timeout=25):
         if head.startswith("<!doctype") or "<html" in head:
             continue  # 拿到的是网页而不是列表
         text = data.decode("utf-8", "ignore")
-        items = parse_m3u(text) if "#EXTINF" in text else parse_txt(text)
+        if text.lstrip().startswith("{") and '"lives"' in text:
+            items, sub_lists = parse_tvbox_json(text)
+            items.extend(fetch_nested_lists(sub_lists, timeout))
+        elif "#EXTINF" in text:
+            items = parse_m3u(text)
+        else:
+            items = parse_txt(text)
         if items:
             return label, url, items
     return label, None, []
@@ -440,16 +515,174 @@ def fetch_haoqu_source(timeout=15, max_pages=800):
     return "好趣网目录", HAOQU_ROOT, items
 
 
-def check_url(url, timeout):
-    code, data = http_get(url, timeout=timeout, max_bytes=4096)
-    # 只有 2xx 成功响应才允许进入最终列表；3xx/4xx/5xx 或无状态码均删除。
-    if code is None or not 200 <= code < 300 or data is None:
+def pick_media_urls(playlist_text, base_url, timeout, depth=0):
+    """返回可用于测速的媒体地址候选（按优先级排序）。
+
+    主播放列表（含 #EXT-X-STREAM-INF）里的地址是清晰度变体，先下钻到子列表；
+    媒体播放列表里同时给出最新分片和最早分片——直播流的旧分片常已被服务器
+    淘汰，只取第一个会被误判成死链。
+    """
+    lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
+    urls = [ln for ln in lines if not ln.startswith("#")]
+    if not urls:
+        return []
+    if any(ln.upper().startswith("#EXT-X-STREAM-INF") for ln in lines):
+        if depth >= 2:
+            return []
+        variant = urljoin(base_url, urls[0])
+        _, data, final = http_get_final(variant, timeout=timeout, max_bytes=32768)
+        if not data:
+            return []
+        return pick_media_urls(data.decode("utf-8", "ignore"), final or variant,
+                               timeout, depth + 1)
+    candidates = [urljoin(base_url, urls[-1])]
+    first = urljoin(base_url, urls[0])
+    if first not in candidates:
+        candidates.append(first)
+    return candidates
+
+
+PLACEHOLDER_MARKERS = ("NOSIGNAL", "NO-SIGNAL", "NO_SIGNAL", "无信号", "NOVIDEO",
+                       "NO_VIDEO", "BLACKSCREEN", "BLACK_SCREEN", "PLACEHOLDER",
+                       "TESTCARD", "COLORBAR", "COLOR_BAR")
+
+# 检测结果分级：这类源的分片时有时无（间歇性），一次性检测只是快照，
+# 所以把"列表正常但当下没取到分片"的降级保留为备用，而不是直接删掉。
+STATE_OK = "ok"      # 列表正常且分片可取，确认可播
+STATE_WEAK = "weak"  # 列表正常但分片未取到，降级为备用
+STATE_DEAD = "dead"  # 列表本身有问题（错误码/网页/占位流/空列表），删除
+
+
+def is_placeholder(*texts):
+    """识别"无信号"之类的占位流：这类地址能返回 200，但画面是空的。"""
+    for t in texts:
+        up = t.upper()
+        if any(mk in up for mk in PLACEHOLDER_MARKERS):
+            return True
+    return False
+
+
+def looks_like_media(data):
+    """判断响应体是不是音视频数据：TS 以 0x47 同步字节开头，FLV/MP4 有各自文件头。"""
+    if not data:
         return False
-    head = data[:4096].decode("utf-8", "ignore").upper()
-    if "#EXTM3U" in head or "#EXT-X" in head:
+    if data[0] == 0x47:
         return True
-    # 有些源不返回标准 HLS 头，放宽判断，但仍必须先通过 2xx 状态码检查。
-    return ".M3U8" in url.upper() or "MPEGURL" in head
+    if data[:3] == b"FLV":
+        return True
+    return b"ftyp" in data[:64]
+
+
+def fetch_sample(url, timeout, sample_bytes, sample_seconds):
+    """限时下载一小段数据测速，返回 (状态码, 字节数, 耗时秒, 是否HTML页面)。"""
+    req = urllib.request.Request(safe_url(url), headers={
+        "User-Agent": UA, "Accept": "*/*",
+        "Accept-Encoding": "identity", "Connection": "close",
+    })
+    got, t0 = 0, time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+            code = resp.getcode()
+            if code is None or not 200 <= code < 300:
+                return code, 0, 0.0, False
+            first = resp.read(2048)
+            got += len(first)
+            if looks_like_html(first.decode("utf-8", "ignore")):
+                return code, got, time.time() - t0, True
+            while got < sample_bytes and time.time() - t0 < sample_seconds:
+                chunk = resp.read(min(16384, sample_bytes - got))
+                if not chunk:
+                    break
+                got += len(chunk)
+            return code, got, time.time() - t0, False
+    except urllib.error.HTTPError as exc:
+        return exc.code, got, time.time() - t0, False
+    except Exception:
+        return None, got, time.time() - t0, False
+
+
+def looks_like_html(text):
+    """判断响应内容是不是网页（错误提示页/登录页等），而不是播放列表或媒体数据。"""
+    head = text[:2048].lstrip("\ufeff \t\r\n").upper()
+    if head.startswith("<!DOCTYPE") or head.startswith("<?XML"):
+        return True
+    return any(tag in head for tag in ("<HTML", "<HEAD", "<BODY", "<SCRIPT", "<TITLE"))
+
+
+def probe_url(url, timeout, sample_bytes=65536, sample_seconds=3.0):
+    """检测可用性并实测下载速度，返回 (state, code, speed_kbps, latency_ms)。
+
+    state 取值见 STATE_OK / STATE_WEAK / STATE_DEAD：
+      - 非 2xx、连接失败、网页错误页、无信号占位流、空播放列表  -> STATE_DEAD
+      - 列表正常但当下没取到分片（间歇性源常见）               -> STATE_WEAK
+      - 列表正常且分片可取                                     -> STATE_OK
+    速度取自分片或直链的实际下载速率，用于同一频道内按流畅度排序。
+    """
+    if is_placeholder(url):
+        return STATE_DEAD, 200, 0.0, 0
+
+    req = urllib.request.Request(safe_url(url), headers={
+        "User-Agent": UA, "Accept": "*/*",
+        "Accept-Encoding": "identity", "Connection": "close",
+    })
+    t0 = time.time()
+    code = ctype = body = None
+    final_url = url  # 跟随重定向后的最终地址，分片相对路径要以它为基准（VLC 同此）
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+                code = resp.getcode()
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                final_url = resp.geturl() or url
+                body = resp.read(32768)
+            break
+        except urllib.error.HTTPError as exc:
+            return STATE_DEAD, exc.code, 0.0, 0
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.6)  # 网络抖动，重试一次再判定
+                continue
+            return STATE_DEAD, None, 0.0, 0
+
+    latency = int((time.time() - t0) * 1000)
+    if code is None or not 200 <= code < 300 or not body:
+        return STATE_DEAD, code, 0.0, latency
+
+    text = body.decode("utf-8", "ignore")
+    head = text[:4096].upper()
+    is_playlist = "#EXTM3U" in head or "#EXT-X" in head
+
+    if not is_playlist:
+        # 没有播放列表特征：网页一律删除；音视频数据或 .m3u8 地址保留
+        if "text/html" in ctype or looks_like_html(text):
+            return STATE_DEAD, code, 0.0, latency
+        if looks_like_media(body) or ".M3U8" in url.upper() or "MPEGURL" in head:
+            speed = len(body) / max(time.time() - t0, 0.05) / 1024
+            return STATE_OK, code, speed, latency
+        return STATE_DEAD, code, 0.0, latency
+
+    if is_placeholder(text):
+        return STATE_DEAD, code, 0.0, latency
+
+    candidates = pick_media_urls(text, final_url, timeout)
+    if not candidates:
+        return STATE_DEAD, code, 0.0, latency  # 空播放列表，没有可用分片
+
+    last_code = None
+    for cand in candidates:
+        if is_placeholder(cand):
+            return STATE_DEAD, code, 0.0, latency  # 无信号占位流
+        seg_code, seg_bytes, seg_secs, seg_html = fetch_sample(
+            cand, timeout, sample_bytes, sample_seconds)
+        if seg_html:
+            continue
+        if seg_code is not None and not 200 <= seg_code < 300:
+            last_code = seg_code
+            continue
+        speed = seg_bytes / seg_secs / 1024 if seg_secs > 0 else 0.0
+        return STATE_OK, code, speed, latency
+
+    return STATE_WEAK, last_code if last_code is not None else code, 0.0, latency
 
 
 def natural_key(name):
@@ -471,6 +704,8 @@ def main():
                     help="每个频道最多保留的地址数（默认8）")
     ap.add_argument("--keep-dead", action="store_true",
                     help="检测后仍保留失效地址")
+    ap.add_argument("--strict", action="store_true",
+                    help="只保留确认可播的地址，丢弃降级备用（默认保留备用）")
     ap.add_argument("--out-prefix", default="tv_channels", help="输出文件名前缀")
     args = ap.parse_args()
 
@@ -517,35 +752,50 @@ def main():
     print("  共 %d 个频道，%d 条唯一地址" % (len(channels), len(unique_urls)))
 
     keep = None  # None = 全部保留
+    speeds = {}  # url -> 实测下载速度 KB/s，用于同一频道内按流畅度排序
+    verified = set()  # 确认可播（列表正常且分片可取）的地址
     if not args.no_check:
-        print("\n[3/3] 检测可用性（超时 %ds，并发 %d）..." % (args.timeout, args.workers))
-        alive = set()
+        print("\n[3/3] 检测可用性并测速（超时 %ds，并发 %d）..." % (args.timeout, args.workers))
+        alive, weak, dead = set(), set(), set()
         done = 0
         t0 = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(check_url, u, args.timeout): u for u in unique_urls}
+            futs = {ex.submit(probe_url, u, args.timeout): u for u in unique_urls}
             for fut in concurrent.futures.as_completed(futs):
                 u = futs[fut]
                 try:
-                    ok = fut.result()
+                    state, code, speed, latency = fut.result()
                 except Exception:
-                    ok = False
-                if ok:
+                    state, speed = STATE_DEAD, 0.0
+                if state == STATE_OK:
                     alive.add(u)
+                    verified.add(u)
+                    speeds[u] = speed
+                elif state == STATE_WEAK:
+                    weak.add(u)
+                else:
+                    dead.add(u)
                 done += 1
                 if done % 200 == 0 or done == len(unique_urls):
                     rate = done / max(time.time() - t0, 0.1)
-                    print("  已检测 %d/%d（%.0f 条/秒），可用 %d"
-                          % (done, len(unique_urls), rate, len(alive)))
-        if not args.keep_dead:
+                    print("  已检测 %d/%d（%.0f 条/秒），确认可播 %d，降级备用 %d"
+                          % (done, len(unique_urls), rate, len(alive), len(weak)))
+        if args.keep_dead:
+            keep = None
+        elif args.strict:
             keep = alive
-        print("  可用地址 %d / %d" % (len(alive), len(unique_urls)))
+        else:
+            keep = alive | weak
+        print("  确认可播 %d，降级备用 %d，已删除 %d / 共 %d"
+              % (len(alive), len(weak), len(dead), len(unique_urls)))
     else:
         print("\n[3/3] 跳过检测（--no-check）")
 
     result = OrderedDict()
     for name, urls in channels.items():
         keep_urls = [u for u in urls if keep is None or u in keep]
+        # 先排确认可播的，再排降级备用的；同档内按实测速度从高到低
+        keep_urls.sort(key=lambda u: (u in verified, speeds.get(u, 0.0)), reverse=True)
         if keep_urls:
             result[name] = keep_urls[:args.max_per_channel]
     if not result:
@@ -581,6 +831,10 @@ def main():
         print("   %-8s %4d 个频道 / %5d 条地址" % (group, cnt, links))
     multi = sum(1 for v in result.values() if len(v) >= 2)
     print("   其中 %d 个频道有 2 个以上备用地址" % multi)
+    if not args.no_check:
+        v1 = sum(1 for v in result.values() for u in v if u in verified)
+        print("   确认可播 %d 条，降级备用 %d 条（同频道内按此顺序排列）"
+              % (v1, total_links - v1))
     print("\n 已保存：")
     print("   %s" % m3u_path)
     print("   %s" % txt_path)
