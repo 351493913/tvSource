@@ -86,6 +86,24 @@ SOURCES = [
         "https://raw.githubusercontent.com/jwqsir2-lang/tvbox-autolive/main/tvbox.json",
         "https://cdn.jsdelivr.net/gh/jwqsir2-lang/tvbox-autolive@main/tvbox.json",
     ]),
+    # cupid940322/iptv-playlist：聚合 Guovin 综合列表 + iptv-search 中国地方台 + eja.tv 中国区频道
+    # （result.m3u8 与上方 Guovin 内容同源，但作为镜像冗余保留，多一路备用；
+    #   jiangsu-multicast 为 rtp:// 运营商组播，脚本只保留 http/https，故不加）
+    ("cupid940322综合源", [
+        "https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/result.m3u8",
+        "https://cdn.jsdelivr.net/gh/cupid940322/iptv-playlist@main/result.m3u8",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/result.m3u8",
+    ]),
+    ("iptv-search中国地方台", [
+        "https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/china-local.m3u8",
+        "https://cdn.jsdelivr.net/gh/cupid940322/iptv-playlist@main/china-local.m3u8",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/china-local.m3u8",
+    ]),
+    ("eja.tv中国频道", [
+        "https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/china.m3u8",
+        "https://cdn.jsdelivr.net/gh/cupid940322/iptv-playlist@main/china.m3u8",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/cupid940322/iptv-playlist/main/china.m3u8",
+    ]),
 ]
 
 # 好趣网是频道目录页，不是现成列表。脚本会抓取目录页，再从每个频道页提取公开的
